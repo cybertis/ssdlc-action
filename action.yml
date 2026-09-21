@@ -1,0 +1,98 @@
+name: "Cybertis SSDLC upload"
+description: >-
+  Push scan reports (gitleaks, Semgrep, OSV, zizmor/SARIF, ZAP, nuclei, testssl,
+  CycloneDX, vitest, Playwright, …) to the Cybertis SSDLC dashboard ingest API.
+  Never fails the job unless `fail-on: gate` and the server gate says fail.
+author: Cybertis
+branding:
+  icon: shield
+  color: blue
+
+# Composite action + one dependency-free Node script. Inputs reach the script
+# ONLY via `env:` (never interpolated into the shell), so untrusted values
+# cannot inject into the step.
+
+inputs:
+  api-token:
+    description: "Client-scoped ingest token (ctk_…). Empty → the step logs a notice and exits 0."
+    required: true
+  endpoint:
+    description: "Ingest URL."
+    default: "https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans"
+  reports:
+    description: |
+      One report per line: `tool=path[:format]`. Globs (`*`, `?`, `**`) allowed;
+      a missing file is a warning, not a failure. Known tools: sarif semgrep gitleaks
+      osv npm-audit zap nuclei testssl cyclonedx dependabot vitest playwright snyk
+      sonarqube zizmor. Formats: json jsonl sarif cyclonedx.
+    required: true
+  target-key:
+    description: "Target key (`github:owner/repo`, `url:https://…`, `host:…`, `custom:…`)."
+    default: "github:${{ github.repository }}"
+  target-kind:
+    description: "REPOSITORY | WEB_APP | HOST — derived from the key prefix when empty."
+    default: ""
+  target-display-name:
+    description: "Display name for the target (defaults to the repo name for github: keys)."
+    default: ""
+  internet-facing:
+    description: '"" (leave unchanged), "true" or "false".'
+    default: ""
+  scope:
+    description: "DEFAULT_BRANCH | SCHEDULED — auto: schedule → SCHEDULED, otherwise DEFAULT_BRANCH."
+    default: ""
+  run-id:
+    description: "CI run id used in the stable externalId `gha:<owner/repo>:<run-id>`."
+    default: "${{ github.run_id }}"
+  mask-secrets:
+    description: "Mask locally before upload (gitleaks Secret→sha256, Match/Line dropped; semgrep extra.lines; SARIF snippets ≤300 chars, codeFlows/relatedLocations dropped)."
+    default: "true"
+  sign:
+    description: "Add X-Cybertis-Timestamp + X-Cybertis-Signature (HMAC-SHA256 keyed by the token)."
+    default: "true"
+  summary:
+    description: "Write a per-tool table to $GITHUB_STEP_SUMMARY."
+    default: "true"
+  allow-pr:
+    description: "Upload on pull_request events too (default: skip with a notice — v1 ingest has no PR scope)."
+    default: "false"
+  fail-on:
+    description: "`none` (default) or `gate` — fail the step only when the server returns gate.pass === false."
+    default: "none"
+  timeout-seconds:
+    description: "Per-request timeout."
+    default: "60"
+
+outputs:
+  scan-run-ids:
+    description: "Comma-separated scanRunIds created/updated by this upload (empty when skipped or failed)."
+    value: ${{ steps.upload.outputs.scan-run-ids }}
+  gate-pass:
+    description: '"true" / "false" from the server gate, empty when skipped or failed.'
+    value: ${{ steps.upload.outputs.gate-pass }}
+  summary-json:
+    description: "JSON array: [{ tool, scanRunId, status, duplicate, summary, warnings }]."
+    value: ${{ steps.upload.outputs.summary-json }}
+
+runs:
+  using: composite
+  steps:
+    - id: upload
+      shell: bash
+      env:
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_ENDPOINT: ${{ inputs.endpoint }}
+        INPUT_REPORTS: ${{ inputs.reports }}
+        INPUT_TARGET_KEY: ${{ inputs.target-key }}
+        INPUT_TARGET_KIND: ${{ inputs.target-kind }}
+        INPUT_TARGET_DISPLAY_NAME: ${{ inputs.target-display-name }}
+        INPUT_INTERNET_FACING: ${{ inputs.internet-facing }}
+        INPUT_SCOPE: ${{ inputs.scope }}
+        INPUT_RUN_ID: ${{ inputs.run-id }}
+        INPUT_MASK_SECRETS: ${{ inputs.mask-secrets }}
+        INPUT_SIGN: ${{ inputs.sign }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+        INPUT_ALLOW_PR: ${{ inputs.allow-pr }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: node "$GITHUB_ACTION_PATH/upload.mjs"
