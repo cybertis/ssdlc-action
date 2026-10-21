@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { gunzipSync } from "node:zlib";
 import {
   buildEnvelope, encodeBody, expandGlob, globToRegExp, GZIP_THRESHOLD, isRetryable, isTerminal, maskReport,
-  parseReportSpecs, renderSummary, resolveScope, retryDelayMs, SCHEMA_ID, signHeaders, skipReason, SNIPPET_MAX, targetKindFor,
+  COVERAGES, DEFAULT_COVERAGE, EXECUTION_STATUSES, parseReportSpecs, parseToolValues, renderSummary, resolveScope, retryDelayMs, SCHEMA_ID, signHeaders, skipReason, SNIPPET_MAX, targetKindFor,
 } from "./upload.mjs";
 
 const hex = (s) => createHash("sha256").update(s).digest("hex");
@@ -24,6 +24,57 @@ test("parseReportSpecs: tool=path[:format], comments, blanks, lower-cased tool",
   ]);
   assert.throws(() => parseReportSpecs("no-equals"), /expected tool=path/);
   assert.throws(() => parseReportSpecs("tool="), /empty path/);
+});
+
+test("parseReportSpecs: @coverage suffix (after :format), unknown suffix stays in the path", () => {
+  const specs = parseReportSpecs("gitleaks=gitleaks.json@range\nzizmor=z.sarif:sarif@tree\nsemgrep=me@host/semgrep.json\nosv=osv.json@bogus");
+  assert.deepEqual(specs, [
+    { tool: "gitleaks", pattern: "gitleaks.json", format: undefined, coverage: "range" },
+    { tool: "zizmor", pattern: "z.sarif", format: "sarif", coverage: "tree" },
+    { tool: "semgrep", pattern: "me@host/semgrep.json", format: undefined },
+    { tool: "osv", pattern: "osv.json@bogus", format: undefined },
+  ]);
+  assert.deepEqual(COVERAGES, ["full", "range", "tree", "diff"]);
+});
+
+test("parseToolValues: bare default + per-tool lines, validation", () => {
+  const cov = parseToolValues("tree\ngitleaks=range", { name: "coverage", allowed: COVERAGES });
+  assert.equal(cov("gitleaks"), "range");
+  assert.equal(cov("semgrep"), "tree");
+  const prof = parseToolValues("semgrep=p/default", { name: "profile", max: 80 });
+  assert.equal(prof("semgrep"), "p/default");
+  assert.equal(prof("gitleaks"), undefined);
+  assert.equal(parseToolValues("")("x"), undefined);
+  assert.throws(() => parseToolValues("gitleaks=everything", { name: "coverage", allowed: COVERAGES }), /expected one of/);
+  assert.throws(() => parseToolValues(`semgrep=${"x".repeat(81)}`, { name: "profile", max: 80 }), /longer than 80/);
+  assert.throws(() => parseToolValues("semgrep=", { name: "profile" }), /empty value/);
+});
+
+test("buildEnvelope: per-report coverage + profile reach the wire", () => {
+  const env = buildEnvelope({ repository: "a/b", runId: "1", targetKey: "github:a/b", eventName: "push" }, [
+    { tool: "gitleaks", text: "[]", coverage: "range" },
+    { tool: "semgrep", text: "{}", coverage: "full", profile: "in-repo" },
+  ]);
+  assert.equal(env.reports[0].coverage, "range");
+  assert.ok(!("profile" in env.reports[0]));
+  assert.equal(env.reports[1].coverage, "full");
+  assert.equal(env.reports[1].profile, "in-repo");
+  assert.ok(!("execution" in env.reports[0]), "no execution claim unless one was given");
+});
+
+test("execution: input values validated; reaches the wire as { status }", () => {
+  const exec = parseToolValues("nuclei=ok\ntestssl=ok\nzap=error", { name: "execution", allowed: EXECUTION_STATUSES });
+  assert.equal(exec("nuclei"), "ok");
+  assert.equal(exec("zap"), "error");
+  assert.equal(exec("semgrep"), undefined);
+  assert.equal(parseToolValues("unknown", { name: "execution", allowed: EXECUTION_STATUSES })("anything"), "unknown");
+  assert.throws(() => parseToolValues("nuclei=fine", { name: "execution", allowed: EXECUTION_STATUSES }), /expected one of ok, error, unknown/);
+  const env = buildEnvelope({ repository: "a/b", runId: "1", targetKey: "url:https://x.io", eventName: "schedule" }, [
+    { tool: "nuclei", text: "", execution: "ok" },
+    { tool: "testssl", text: "[]" },
+  ]);
+  assert.deepEqual(env.reports[0].execution, { status: "ok" });
+  assert.ok(!("execution" in env.reports[1]));
 });
 
 test("globToRegExp: *, ?, ** semantics", () => {
@@ -127,8 +178,10 @@ test("buildEnvelope: contract fields, externalId recipe, target kind/flags, base
   assert.equal(env.run.ciRunUrl, "https://github.com/acme/webapp/actions/runs/1234567890");
   assert.equal(env.run.completedAt, "2026-09-14T06:00:00.000Z");
   assert.equal(env.reports.length, 2);
-  assert.deepEqual(env.reports[0], { tool: "semgrep", format: "json", content: Buffer.from('{"results":[]}').toString("base64"), encoding: "base64", sha256: hex('{"results":[]}') });
+  assert.deepEqual(env.reports[0], { tool: "semgrep", format: "json", content: Buffer.from('{"results":[]}').toString("base64"), encoding: "base64", sha256: hex('{"results":[]}'), coverage: DEFAULT_COVERAGE });
   assert.equal(env.reports[1].format, undefined);
+  assert.equal(env.reports[1].coverage, "full", "coverage defaults to full");
+  assert.ok(!("profile" in env.reports[1]), "no profile unless one was given");
   assert.equal(Buffer.from(env.reports[1].content, "base64").toString(), "[]");
 });
 

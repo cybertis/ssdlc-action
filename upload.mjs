@@ -10,6 +10,15 @@ import { gzipSync } from "node:zlib";
 
 export const SCHEMA_ID = "cybertis.ssdlc.ingest/1";
 export const FORMATS = ["json", "jsonl", "sarif", "cyclonedx"];
+// What a report covers (README, "coverage" input): only `full` / `tree` runs may
+// auto-resolve findings on the server; `range` / `diff` never do.
+export const COVERAGES = ["full", "range", "tree", "diff"];
+export const DEFAULT_COVERAGE = "full";
+// How the scanner process ended, per report (`execution.status`). `ok` is the
+// server's only proof that an EMPTY report (e.g. nuclei JSONL) is a clean
+// scan; `error` makes the run PARTIAL. Absent = no claim.
+export const EXECUTION_STATUSES = ["ok", "error", "unknown"];
+export const PROFILE_MAX = 80;
 export const GZIP_THRESHOLD = 256 * 1024;
 export const SNIPPET_MAX = 300;
 export const USER_AGENT = "cybertis-ssdlc-upload/1";
@@ -21,26 +30,56 @@ const TIERS = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"];
 export const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const truthy = (v) => /^(true|1|yes)$/i.test(String(v ?? "").trim());
 
-/** `tool=path[:format]` per line; `#` comments and blank lines ignored. */
+/** `tool=path[:format][@coverage]` per line; `#` comments and blank lines ignored. */
 export function parseReportSpecs(text) {
   const specs = [];
   for (const raw of String(text ?? "").split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
-    if (eq <= 0) throw new Error(`bad report spec "${line}" (expected tool=path[:format])`);
+    if (eq <= 0) throw new Error(`bad report spec "${line}" (expected tool=path[:format][@coverage])`);
     const tool = line.slice(0, eq).trim().toLowerCase();
     let pattern = line.slice(eq + 1).trim();
     let format;
+    let coverage;
+    const at = pattern.lastIndexOf("@");
+    if (at > 0 && COVERAGES.includes(pattern.slice(at + 1))) {
+      coverage = pattern.slice(at + 1);
+      pattern = pattern.slice(0, at);
+    }
     const colon = pattern.lastIndexOf(":");
     if (colon > 0 && FORMATS.includes(pattern.slice(colon + 1))) {
       format = pattern.slice(colon + 1);
       pattern = pattern.slice(0, colon);
     }
     if (!pattern) throw new Error(`bad report spec "${line}" (empty path)`);
-    specs.push({ tool, pattern, format });
+    specs.push(coverage ? { tool, pattern, format, coverage } : { tool, pattern, format });
   }
   return specs;
+}
+
+/**
+ * The `coverage` / `profile` inputs: either ONE bare value for every report,
+ * or `tool=value` lines (per tool; a bare line is the default for the rest).
+ * Returns `(tool) => value | undefined`. `allowed` (optional) validates values.
+ */
+export function parseToolValues(text, { name, allowed, max } = {}) {
+  let fallback;
+  const byTool = new Map();
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    const tool = eq > 0 ? line.slice(0, eq).trim().toLowerCase() : null;
+    const value = (eq > 0 ? line.slice(eq + 1) : line).trim();
+    if (!value) throw new Error(`bad ${name ?? "value"} "${line}" (empty value)`);
+    if (allowed && !allowed.includes(value)) throw new Error(`bad ${name ?? "value"} "${value}" (expected one of ${allowed.join(", ")})`);
+    if (max && value.length > max) throw new Error(`bad ${name ?? "value"} "${value.slice(0, 20)}…" (longer than ${max} characters)`);
+    if ([...value].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)) throw new Error(`bad ${name ?? "value"} (control characters)`);
+    if (tool) byTool.set(tool, value);
+    else fallback = value;
+  }
+  return (tool) => byTool.get(tool) ?? fallback;
 }
 
 export function globToRegExp(glob) {
@@ -155,6 +194,9 @@ export function buildEnvelope(ctx, reports) {
     reports: reports.map((r) => {
       const entry = { tool: r.tool, content: Buffer.from(r.text, "utf8").toString("base64"), encoding: "base64", sha256: sha256(Buffer.from(r.text, "utf8")) };
       if (r.format) entry.format = r.format;
+      entry.coverage = r.coverage ?? DEFAULT_COVERAGE;
+      if (r.profile) entry.profile = r.profile;
+      if (r.execution) entry.execution = { status: r.execution };
       return entry;
     }),
   };
@@ -280,6 +322,14 @@ export async function main() {
   const endpoint = input("endpoint", "https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans").replace(/\/+$/, "");
   const timeoutMs = Math.max(5, Number(input("timeout-seconds", "60")) || 60) * 1000;
   const mask = truthy(input("mask-secrets", "true"));
+  // A bad coverage / profile input must not cost the upload: warn and fall
+  // back (coverage → full per report, no profile).
+  const safeToolValues = (name, opts) => {
+    try { return parseToolValues(input(name), { name, ...opts }); } catch (e) { log.warn(`ssdlc-upload: ${e?.message ?? e} — input "${name}" ignored`); return () => undefined; }
+  };
+  const coverageOf = safeToolValues("coverage", { allowed: COVERAGES });
+  const profileOf = safeToolValues("profile", { max: PROFILE_MAX });
+  const executionOf = safeToolValues("execution", { allowed: EXECUTION_STATUSES });
   const reports = [];
   for (const spec of parseReportSpecs(input("reports"))) {
     const files = expandGlob(spec.pattern);
@@ -288,8 +338,11 @@ export async function main() {
     if (reports.some((r) => r.tool === spec.tool)) { log.warn(`ssdlc-upload: ${spec.tool} listed twice — keeping the first`); continue; }
     const raw = readFileSync(files[0], "utf8");
     const { text, changed } = mask ? maskReport(spec.tool, spec.format, raw) : { text: raw, changed: 0 };
-    console.log(`ssdlc-upload: ${spec.tool} ← ${path.relative(process.cwd(), files[0])} (${raw.length} chars${changed ? `, ${changed} field(s) masked` : ""})`);
-    reports.push({ tool: spec.tool, format: spec.format, text });
+    const coverage = spec.coverage ?? coverageOf(spec.tool) ?? DEFAULT_COVERAGE;
+    const profile = profileOf(spec.tool);
+    const execution = executionOf(spec.tool);
+    console.log(`ssdlc-upload: ${spec.tool} ← ${path.relative(process.cwd(), files[0])} (${raw.length} chars${changed ? `, ${changed} field(s) masked` : ""}, coverage ${coverage}${profile ? `, profile ${profile}` : ""}${execution ? `, execution ${execution}` : ""})`);
+    reports.push({ tool: spec.tool, format: spec.format, coverage, profile, execution, text });
   }
   if (!reports.length) { log.warn("ssdlc-upload: no reports found — nothing uploaded"); writeSummary(renderSummary({ skipped: "no report files found" })); emptyOutputs(); return 0; }
 

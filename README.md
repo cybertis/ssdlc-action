@@ -95,7 +95,10 @@ jobs:
 |---|---|---|
 | `api-token` | — (required) | Client-scoped token `ctk_…`. **Empty → skip with a notice.** Masked with `::add-mask::` first thing. |
 | `endpoint` | `https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans` | |
-| `reports` | — (required) | One per line: `tool=path[:format]`. Globs `*` `?` `**`; first match wins; missing → warning. Tools: `sarif semgrep gitleaks osv npm-audit zap nuclei testssl cyclonedx dependabot vitest playwright snyk sonarqube zizmor`. Formats: `json jsonl sarif cyclonedx`. |
+| `reports` | — (required) | One per line: `tool=path[:format][@coverage]`. Globs `*` `?` `**`; first match wins; missing → warning. Tools: `sarif semgrep gitleaks osv npm-audit zap nuclei testssl cyclonedx dependabot vitest playwright snyk sonarqube zizmor`. Formats: `json jsonl sarif cyclonedx`. |
+| `coverage` | `full` | What each report covers: `full` \| `tree` \| `range` \| `diff`. Only `full` / `tree` let the dashboard auto-resolve findings a report no longer contains; a `range` scan (e.g. gitleaks over a push's commits) or a `diff` scan never resolves. One bare value for every report, or `tool=value` lines; `@coverage` in `reports` wins. *(v1.1.0)* |
+| `profile` | `""` | Ruleset / scan profile, ≤ 80 chars (`p/default`, `in-repo`, `community`, …). A finding created by a profile is only auto-resolved by a run of the same profile, so two rulesets on one repo never close each other's findings. Bare value or `tool=value` lines. *(v1.1.0)* |
+| `execution` | `""` | How each scanner process ended: `ok` \| `error` \| `unknown`. `ok` is the only proof that an **empty** report (e.g. an empty nuclei JSONL) is a clean scan; `error` marks the run incomplete, so it resolves nothing. Bare value or `tool=value` lines; empty = no claim. *(v1.1.0)* |
 | `target-key` | `github:<owner/repo>` | `github:` `gitlab:` `url:` `host:` `custom:` prefix. |
 | `target-kind` | derived | `REPOSITORY` (github/gitlab/custom), `WEB_APP` (url), `HOST` (host). |
 | `target-display-name` | repo name for `github:` keys | |
@@ -108,6 +111,26 @@ jobs:
 | `allow-pr` | `false` | v1 ingest has no PR scope: on `pull_request` the step exits 0 with a notice. |
 | `fail-on` | `none` | `gate` → fail only when the server answers `gate.pass === false`. |
 | `timeout-seconds` | `60` | Per HTTP request. |
+
+An invalid `coverage` / `profile` / `execution` value is a `::warning::` and is
+ignored — it never costs the upload.
+
+```yaml
+# v1.1.0 — declare what each report covers and how the scanner ended
+- uses: cybertis/ssdlc-action@v1
+  with:
+    api-token: ${{ secrets.CYBERTIS_SSDLC_TOKEN }}
+    coverage: |
+      gitleaks=range            # scanned only the pushed commits — never auto-resolves
+    profile: |
+      semgrep=p/default
+    execution: |
+      nuclei=ok                 # the scanner ran; an empty report is a clean scan
+    reports: |
+      gitleaks=gitleaks.json
+      semgrep=semgrep.json
+      nuclei=nuclei.jsonl:jsonl
+```
 
 ## Outputs
 
@@ -123,7 +146,8 @@ jobs:
 2. Builds the envelope (schema `cybertis.ssdlc.ingest/1`): `run.externalId`,
    target, scope, `branchRef` = `GITHUB_REF`, `commitSha` = `GITHUB_SHA`,
    `ciProvider: github-actions`, `ciRunUrl`, `defaultBranch` from the event
-   payload; each report is base64 + sha256.
+   payload; each report is base64 + sha256, with its `coverage` (default
+   `full`) and, when given, `profile` and `execution: { status }`.
 3. Gzips the body above 256 KB, signs the wire bytes, POSTs with
    `Authorization: Bearer`. Retries ×3 on 429 / 5xx / network errors
    (1 s, 2 s, 4 s; `Retry-After` honoured, capped at 30 s).
@@ -138,6 +162,11 @@ destination is `endpoint`.
 
 `v1` is a moving tag that follows the latest `v1.x.y` release; breaking changes
 get a new major tag.
+
+- **v1.1.0** — new optional inputs `coverage`, `profile`, `execution` and the
+  `@coverage` suffix in `reports`; every report now carries a `coverage`
+  (default `full`, which is how the server read v1.0.0 reports too).
+- **v1.0.0** — first public release.
 
 ## Development
 
@@ -185,7 +214,10 @@ Cybertis. קובץ Node אחד ללא תלויות — קל לבדוק אותו 
 | קלט | ברירת מחדל | הערות |
 |---|---|---|
 | `api-token` | חובה | טוקן לקוח `ctk_…`. **ריק → דילוג עם הודעה.** |
-| `reports` | חובה | שורה לכל דוח: `tool=path[:format]`. תווים כלליים (`*`, `**`) מותרים; קובץ חסר = אזהרה בלבד. |
+| `reports` | חובה | שורה לכל דוח: `tool=path[:format][@coverage]`. תווים כלליים (`*`, `**`) מותרים; קובץ חסר = אזהרה בלבד. |
+| `coverage` | `full` | מה הדוח מכסה: `full` / `tree` / `range` / `diff`. רק `full` ו-`tree` סוגרים אוטומטית ממצאים שנעלמו; סריקת `range` (למשל gitleaks על טווח הקומיטים של push) או `diff` לעולם לא סוגרת. ערך אחד לכל הדוחות או שורות `tool=value`. *(v1.1.0)* |
+| `profile` | ריק | פרופיל / סט חוקים (עד 80 תווים: `p/default`, `in-repo`, `community`). ממצא שנוצר בפרופיל נסגר אוטומטית רק בריצה של אותו פרופיל. *(v1.1.0)* |
+| `execution` | ריק | איך הסתיים תהליך הסורק: `ok` / `error` / `unknown`. `ok` הוא ההוכחה היחידה שדוח **ריק** הוא סריקה נקייה; `error` מסמן את הריצה כחלקית ולא נסגר דבר. *(v1.1.0)* |
 | `target-key` | `github:<owner/repo>` | לאתרי web: `url:https://…` (הסוג נגזר אוטומטית). |
 | `internet-facing` | ריק | `"true"` / `"false"` מעדכן את היעד. |
 | `scope` | אוטומטי | `schedule` → `SCHEDULED`, אחרת `DEFAULT_BRANCH`. |

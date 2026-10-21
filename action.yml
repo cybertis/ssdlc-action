@@ -21,11 +21,31 @@ inputs:
     default: "https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans"
   reports:
     description: |
-      One report per line: `tool=path[:format]`. Globs (`*`, `?`, `**`) allowed;
+      One report per line: `tool=path[:format][@coverage]`. Globs (`*`, `?`, `**`) allowed;
       a missing file is a warning, not a failure. Known tools: sarif semgrep gitleaks
       osv npm-audit zap nuclei testssl cyclonedx dependabot vitest playwright snyk
-      sonarqube zizmor. Formats: json jsonl sarif cyclonedx.
+      sonarqube zizmor. Formats: json jsonl sarif cyclonedx. Coverage: see `coverage`.
     required: true
+  coverage:
+    description: |
+      What each report covers: full | tree | range | diff (default full). Only full and
+      tree runs let the dashboard auto-resolve findings the report no longer contains;
+      a range/diff scan (e.g. gitleaks over a push's commit range) never resolves.
+      One bare value for every report, or `tool=value` lines; `@coverage` in `reports` wins.
+    default: ""
+  profile:
+    description: |
+      Ruleset / scan profile (≤ 80 chars, e.g. `p/default`, `in-repo`, `community`).
+      A run only resolves findings its own profile created. One bare value for every
+      report, or `tool=value` lines. Empty = no profile.
+    default: ""
+  execution:
+    description: |
+      How each scanner process ended: ok | error | unknown. `ok` is the dashboard's only
+      proof that an EMPTY report is a clean scan (otherwise it is not trusted to resolve
+      anything); `error` marks the run incomplete. One bare value for every report, or
+      `tool=value` lines. Empty = no claim.
+    default: ""
   target-key:
     description: "Target key (`github:owner/repo`, `url:https://…`, `host:…`, `custom:…`)."
     default: "github:${{ github.repository }}"
@@ -83,6 +103,9 @@ runs:
         INPUT_API_TOKEN: ${{ inputs.api-token }}
         INPUT_ENDPOINT: ${{ inputs.endpoint }}
         INPUT_REPORTS: ${{ inputs.reports }}
+        INPUT_COVERAGE: ${{ inputs.coverage }}
+        INPUT_PROFILE: ${{ inputs.profile }}
+        INPUT_EXECUTION: ${{ inputs.execution }}
         INPUT_TARGET_KEY: ${{ inputs.target-key }}
         INPUT_TARGET_KIND: ${{ inputs.target-kind }}
         INPUT_TARGET_DISPLAY_NAME: ${{ inputs.target-display-name }}
