@@ -4,6 +4,7 @@ description: >-
   CycloneDX, vitest, Playwright, …) to the Cybertis SSDLC dashboard ingest API.
   Never fails the job unless `fail-on: gate` and the server gate says fail.
 author: Cybertis
+
 branding:
   icon: shield
   color: blue
@@ -14,8 +15,24 @@ branding:
 
 inputs:
   api-token:
-    description: "Client-scoped ingest token (ctk_…). Empty → the step logs a notice and exits 0."
-    required: true
+    description: "Client-scoped ingest token (ctk_…). Empty and no OIDC → the step logs a notice and exits 0."
+    required: false
+    default: ""
+  auth:
+    description: |
+      token | oidc | auto (default). `oidc` authenticates with a GitHub Actions OIDC id token
+      instead of `api-token` (the job needs `permissions: id-token: write`; the repository must
+      be an SSDLC target of the client's Cybertis GitHub App installation). `auto` uses OIDC
+      when the job can mint a token AND `api-token` is empty or `prefer-oidc` is true.
+      Fails safe: no id token, or the server refuses the OIDC credential → one
+      retry with `api-token` when one is given.
+    default: "auto"
+  prefer-oidc:
+    description: "With auth: auto — use OIDC even when api-token is set (the token stays the fallback)."
+    default: "false"
+  oidc-audience:
+    description: "`aud` of the id token. Default: the endpoint's origin (what the platform expects)."
+    default: ""
   endpoint:
     description: "Ingest URL."
     default: "https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans"
@@ -59,7 +76,13 @@ inputs:
     description: '"" (leave unchanged), "true" or "false".'
     default: ""
   scope:
-    description: "DEFAULT_BRANCH | SCHEDULED — auto: schedule → SCHEDULED, otherwise DEFAULT_BRANCH."
+    description: |
+      auto (default) | push | schedule | pull_request → DEFAULT_BRANCH | SCHEDULED | PULL_REQUEST.
+      auto derives it from the event: schedule → SCHEDULED, pull_request → PULL_REQUEST,
+      anything else → DEFAULT_BRANCH. The wire values themselves are accepted too.
+      A PULL_REQUEST run carries `run.pullRequest` (number, head/base sha, base ref) read
+      from the event payload; a pull_request event uploads only with `scope: pull_request`
+      (or `allow-pr: true`). (v1.2.0)
     default: ""
   run-id:
     description: "CI run id used in the stable externalId `gha:<owner/repo>:<run-id>`."
@@ -68,13 +91,13 @@ inputs:
     description: "Mask locally before upload (gitleaks Secret→sha256, Match/Line dropped; semgrep extra.lines; SARIF snippets ≤300 chars, codeFlows/relatedLocations dropped)."
     default: "true"
   sign:
-    description: "Add X-Cybertis-Timestamp + X-Cybertis-Signature (HMAC-SHA256 keyed by the token)."
+    description: "Add X-Cybertis-Timestamp + X-Cybertis-Signature (HMAC-SHA256 keyed by the token). Token auth only."
     default: "true"
   summary:
     description: "Write a per-tool table to $GITHUB_STEP_SUMMARY."
     default: "true"
   allow-pr:
-    description: "Upload on pull_request events too (default: skip with a notice — v1 ingest has no PR scope)."
+    description: "Upload on pull_request events with the auto scope (PULL_REQUEST). Default: a PR event is skipped with a notice unless `scope: pull_request`."
     default: "false"
   fail-on:
     description: "`none` (default) or `gate` — fail the step only when the server returns gate.pass === false."
@@ -101,6 +124,9 @@ runs:
       shell: bash
       env:
         INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_AUTH: ${{ inputs.auth }}
+        INPUT_PREFER_OIDC: ${{ inputs.prefer-oidc }}
+        INPUT_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
         INPUT_ENDPOINT: ${{ inputs.endpoint }}
         INPUT_REPORTS: ${{ inputs.reports }}
         INPUT_COVERAGE: ${{ inputs.coverage }}

@@ -2,14 +2,15 @@
 // Run: node --test .github/actions/ssdlc-upload/upload.test.mjs
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { gunzipSync } from "node:zlib";
 import {
+  AUTH_MODES, fetchIdToken, main, oidcAudienceFor, resolveAuthMode, shouldFallBackToToken,
   buildEnvelope, encodeBody, expandGlob, globToRegExp, GZIP_THRESHOLD, isRetryable, isTerminal, maskReport,
-  COVERAGES, DEFAULT_COVERAGE, EXECUTION_STATUSES, parseReportSpecs, parseToolValues, renderSummary, resolveScope, retryDelayMs, SCHEMA_ID, signHeaders, skipReason, SNIPPET_MAX, targetKindFor,
+  COVERAGES, DEFAULT_COVERAGE, EXECUTION_STATUSES, isKnownScopeInput, parseReportSpecs, pullRequestFromEvent, SCOPES, parseToolValues, renderSummary, resolveScope, retryDelayMs, SCHEMA_ID, signHeaders, skipReason, SNIPPET_MAX, targetKindFor,
 } from "./upload.mjs";
 
 const hex = (s) => createHash("sha256").update(s).digest("hex");
@@ -114,6 +115,64 @@ test("resolveScope / targetKindFor / skipReason", () => {
   assert.match(skipReason({ token: "t", eventName: "pull_request", allowPr: false }), /pull_request/);
   assert.equal(skipReason({ token: "t", eventName: "pull_request", allowPr: true }), null);
   assert.equal(skipReason({ token: "t", eventName: "push", allowPr: false }), null);
+});
+
+test("resolveScope: auto from the event, the four input forms, v1.1 wire values, unknown → auto", () => {
+  assert.deepEqual(SCOPES, ["DEFAULT_BRANCH", "SCHEDULED", "PULL_REQUEST"]);
+  assert.equal(resolveScope("", "pull_request"), "PULL_REQUEST");
+  assert.equal(resolveScope("auto", "pull_request_target"), "PULL_REQUEST");
+  assert.equal(resolveScope("auto", "schedule"), "SCHEDULED");
+  assert.equal(resolveScope("push", "schedule"), "DEFAULT_BRANCH");
+  assert.equal(resolveScope("schedule", "workflow_dispatch"), "SCHEDULED");
+  assert.equal(resolveScope(" Pull_Request ", "push"), "PULL_REQUEST");
+  assert.equal(resolveScope("SCHEDULED", "workflow_dispatch"), "SCHEDULED");
+  assert.equal(resolveScope("DEFAULT_BRANCH", "schedule"), "DEFAULT_BRANCH");
+  assert.equal(resolveScope("PULL_REQUEST", "pull_request"), "PULL_REQUEST");
+  for (const bad of ["nightly", "constructor", "__proto__", "toString"]) {
+    assert.equal(isKnownScopeInput(bad), false, bad);
+    assert.equal(resolveScope(bad, "push"), "DEFAULT_BRANCH", bad);
+  }
+  for (const ok of ["", "auto", "push", "schedule", "pull_request", "SCHEDULED", "default_branch"]) assert.equal(isKnownScopeInput(ok), true, ok);
+});
+
+test("skipReason: a PR event uploads only on opt-in (scope: pull_request or allow-pr)", () => {
+  assert.match(skipReason({ token: "t", eventName: "pull_request", allowPr: false, scopeInput: "" }), /without scope: pull_request/);
+  assert.match(skipReason({ token: "t", eventName: "pull_request", allowPr: false, scopeInput: "auto" }), /without scope: pull_request/);
+  assert.match(skipReason({ token: "t", eventName: "pull_request_target", allowPr: false }), /pull_request_target/);
+  assert.equal(skipReason({ token: "t", eventName: "pull_request", allowPr: false, scopeInput: "pull_request" }), null);
+  assert.equal(skipReason({ token: "", eventName: "pull_request", allowPr: false, scopeInput: "pull_request", oidc: true }), null);
+});
+
+const SHA_H = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+const PR_EVENT = { pull_request: { number: 42, head: { sha: SHA_H, ref: "feat/x" }, base: { sha: SHA_B, ref: "main" } }, repository: { default_branch: "main" } };
+
+test("pullRequestFromEvent: number, head/base sha, base ref; anything malformed → null", () => {
+  assert.deepEqual(pullRequestFromEvent(PR_EVENT), { number: 42, headSha: SHA_H, baseSha: SHA_B, baseRef: "main" });
+  assert.equal(pullRequestFromEvent(null), null);
+  assert.equal(pullRequestFromEvent({ ref: "refs/heads/main" }), null);
+  const pr = (over) => ({ pull_request: { ...PR_EVENT.pull_request, ...over } });
+  assert.equal(pullRequestFromEvent(pr({ number: 0 })), null);
+  assert.equal(pullRequestFromEvent(pr({ number: "42" })), null);
+  assert.equal(pullRequestFromEvent(pr({ head: { sha: "abc123" } })), null);
+  assert.equal(pullRequestFromEvent(pr({ base: { sha: SHA_B.toUpperCase(), ref: "main" } })), null);
+  assert.equal(pullRequestFromEvent(pr({ base: { sha: SHA_B, ref: "" } })), null);
+  assert.equal(pullRequestFromEvent(pr({ base: { sha: SHA_B, ref: "ma\nin" } })), null);
+  assert.equal(pullRequestFromEvent(pr({ base: { sha: SHA_B, ref: "x".repeat(256) } })), null);
+});
+
+test("buildEnvelope: run.pullRequest only for PULL_REQUEST; externalId per run (+ :a<N> on re-runs)", () => {
+  const prFields = pullRequestFromEvent(PR_EVENT);
+  const env = buildEnvelope({ repository: "o/r", runId: "900", runAttempt: "1", targetKey: "github:o/r", scope: "pull_request", eventName: "pull_request", pullRequest: prFields, ref: "refs/pull/42/merge" }, [{ tool: "semgrep", text: "{}" }]);
+  assert.equal(env.run.scope, "PULL_REQUEST");
+  assert.deepEqual(env.run.pullRequest, { number: 42, headSha: SHA_H, baseSha: SHA_B, baseRef: "main" });
+  assert.equal(env.run.externalId, "gha:o/r:900");
+  assert.equal(env.run.branchRef, "refs/pull/42/merge");
+  const rerun = buildEnvelope({ repository: "o/r", runId: "900", runAttempt: "3", targetKey: "github:o/r", scope: "PULL_REQUEST", eventName: "pull_request", pullRequest: prFields }, [{ tool: "semgrep", text: "{}" }]);
+  assert.equal(rerun.run.externalId, "gha:o/r:900:a3");
+  const push = buildEnvelope({ repository: "o/r", runId: "901", targetKey: "github:o/r", scope: "", eventName: "push", pullRequest: prFields }, [{ tool: "semgrep", text: "{}" }]);
+  assert.equal(push.run.scope, "DEFAULT_BRANCH");
+  assert.equal(push.run.pullRequest, undefined);
 });
 
 test("maskReport gitleaks: Secret → bare sha256 hex (server-compatible), Match/Line dropped, already-hashed untouched", () => {
@@ -246,4 +305,246 @@ test("renderSummary: per-tool table, tiers, warnings, gate line; skipped and err
   assert.match(renderSummary({ gate: { mode: "BLOCKING", pass: false, reasons: ["2 CRITICAL"] } }), /:x: fail \(2 CRITICAL\)/);
   assert.match(renderSummary({ skipped: "api-token is empty" }), /_Skipped: api-token is empty_/);
   assert.match(renderSummary({ error: "HTTP 403 feature_disabled" }), /:warning: HTTP 403 feature_disabled/);
+});
+
+// ── auth: token | oidc | auto ───────────────────────────────────────────────
+test("resolveAuthMode: auto prefers OIDC only without a token or with prefer-oidc; fails SAFE to the token", () => {
+  assert.deepEqual(AUTH_MODES, ["token", "oidc", "auto"]);
+  const r = (o) => resolveAuthMode({ auth: "auto", token: "", preferOidc: false, oidcAvailable: false, ...o }).mode;
+  // auto
+  assert.equal(r({ token: "t", oidcAvailable: true }), "token"); // v1.1 behaviour: a token still wins
+  assert.equal(r({ token: "t", oidcAvailable: true, preferOidc: true }), "oidc");
+  assert.equal(r({ token: "", oidcAvailable: true }), "oidc");
+  assert.equal(r({ token: "t", oidcAvailable: false, preferOidc: true }), "token"); // no id-token permission
+  assert.equal(r({ token: "", oidcAvailable: false }), null);
+  // token
+  assert.equal(r({ auth: "token", token: "t", oidcAvailable: true, preferOidc: true }), "token");
+  assert.equal(r({ auth: "token", token: "", oidcAvailable: true }), null);
+  // oidc
+  assert.equal(r({ auth: "oidc", token: "t", oidcAvailable: true }), "oidc");
+  assert.equal(r({ auth: "oidc", token: "t", oidcAvailable: false }), "token");
+  assert.match(resolveAuthMode({ auth: "oidc", token: "t", oidcAvailable: false }).note, /id-token: write/);
+  assert.equal(r({ auth: "oidc", token: "", oidcAvailable: false }), null);
+  // unknown value → auto, with a note
+  const odd = resolveAuthMode({ auth: "magic", token: "t", oidcAvailable: true });
+  assert.equal(odd.mode, "token");
+  assert.match(odd.note, /unknown auth "magic"/);
+  assert.equal(resolveAuthMode({ auth: "", token: "t", oidcAvailable: true }).note, null);
+});
+
+test("skipReason: an OIDC upload needs no api-token", () => {
+  assert.match(skipReason({ token: "", eventName: "push", allowPr: false }), /api-token is empty/);
+  assert.equal(skipReason({ token: "", eventName: "push", allowPr: false, oidc: true }), null);
+  assert.match(skipReason({ token: "", eventName: "pull_request", allowPr: false, oidc: true }), /pull_request/);
+});
+
+test("oidcAudienceFor: explicit input, else the endpoint origin", () => {
+  assert.equal(oidcAudienceFor("https://platform.cybertis.co.il/api/ingest/ssdlc/v1/scans"), "https://platform.cybertis.co.il");
+  assert.equal(oidcAudienceFor("https://staging.example.com:8443/api/x", ""), "https://staging.example.com:8443");
+  assert.equal(oidcAudienceFor("https://platform.cybertis.co.il/api", "cybertis-ssdlc"), "cybertis-ssdlc");
+});
+
+test("fetchIdToken: audience appended to the runner URL, bearer = request token; failures throw", async () => {
+  const calls = [];
+  const ok = async (url, init) => { calls.push({ url, init }); return new Response(JSON.stringify({ value: "h.p.s" }), { status: 200 }); };
+  const value = await fetchIdToken({ requestUrl: "https://runner.example/token?api-version=2.0", requestToken: "rt", audience: "https://platform.example.com", fetchImpl: ok });
+  assert.equal(value, "h.p.s");
+  const u = new URL(calls[0].url);
+  assert.equal(u.searchParams.get("api-version"), "2.0");
+  assert.equal(u.searchParams.get("audience"), "https://platform.example.com");
+  assert.equal(calls[0].init.headers.authorization, "bearer rt");
+  await assert.rejects(fetchIdToken({ requestUrl: "https://runner.example/t", requestToken: "rt", audience: "a", fetchImpl: async () => new Response("{}", { status: 403 }) }), /HTTP 403/);
+  await assert.rejects(fetchIdToken({ requestUrl: "https://runner.example/t", requestToken: "rt", audience: "a", fetchImpl: async () => new Response(JSON.stringify({ value: "nope" }), { status: 200 }) }), /no token/);
+});
+
+// main() end to end with a stubbed fetch: which credential reaches the ingest endpoint.
+async function runMain({ inputs = {}, env = {}, idTokenStatus = 200, failFirstPost = false, firstPost = null, event = null } = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), "ssdlc-auth-"));
+  const report = path.join(dir, "semgrep.json");
+  writeFileSync(report, JSON.stringify({ results: [], errors: [], paths: { scanned: ["a.ts"] } }));
+  const eventPath = path.join(dir, "event.json");
+  writeFileSync(eventPath, JSON.stringify(event ?? { repository: { default_branch: "main" } }));
+  const vars = {
+    INPUT_REPORTS: `semgrep=${report}`, INPUT_ENDPOINT: "https://platform.example.com/api/ingest/ssdlc/v1/scans", INPUT_SUMMARY: "false",
+    GITHUB_EVENT_NAME: "push", GITHUB_REPOSITORY: "acme/app", GITHUB_RUN_ID: "77", GITHUB_SHA: "3b02c255", GITHUB_REF: "refs/heads/main",
+    GITHUB_OUTPUT: "", GITHUB_STEP_SUMMARY: "", ACTIONS_ID_TOKEN_REQUEST_URL: "", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "", GITHUB_EVENT_PATH: eventPath, GITHUB_RUN_ATTEMPT: "1",
+    ...Object.fromEntries(Object.entries(inputs).map(([k, v]) => [`INPUT_${k.replace(/-/g, "_").toUpperCase()}`, v])),
+    ...env,
+  };
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  const calls = [];
+  const logs = [];
+  let n = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method ?? "GET", headers: init.headers ?? {}, body: init.body });
+    if (String(url).startsWith("https://runner.example/")) {
+      return idTokenStatus === 200 ? new Response(JSON.stringify({ value: `h.jwt${++n}.s` }), { status: 200 }) : new Response("{}", { status: idTokenStatus });
+    }
+    if (firstPost && calls.filter((c) => c.method === "POST").length === 1) return new Response(JSON.stringify({ error: firstPost.error, message: "x" }), { status: firstPost.status });
+    if (failFirstPost && calls.filter((c) => c.method === "POST").length === 1) return new Response(JSON.stringify({ error: "storage_unavailable" }), { status: 503, headers: { "retry-after": "1" } });
+    return new Response(JSON.stringify({ runs: [{ tool: "semgrep", status: "COMPLETED", scanRunId: "r1" }], gate: { mode: "REPORT_ONLY", pass: true } }), { status: 200 });
+  };
+  console.log = (m) => logs.push(String(m));
+  try {
+    const code = await main();
+    return { code, calls, logs, posts: calls.filter((c) => c.method === "POST") };
+  } finally {
+    globalThis.fetch = realFetch;
+    console.log = realLog;
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+}
+const OIDC_ENV = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://runner.example/token?api-version=2.0", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "rt" };
+
+test("main: token mode (the v1.1 path) — bearer api-token + HMAC, no id token requested", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test" }, env: OIDC_ENV });
+  assert.equal(r.code, 0);
+  assert.equal(r.posts.length, 1);
+  assert.equal(r.posts[0].headers.authorization, "Bearer ctk_test");
+  assert.ok(r.posts[0].headers["x-cybertis-signature"]);
+  assert.ok(!r.calls.some((c) => c.url.startsWith("https://runner.example/")));
+});
+
+test("main: prefer-oidc with id-token permission — bearer id token minted for the endpoint origin, no HMAC", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", "prefer-oidc": "true" }, env: OIDC_ENV });
+  assert.equal(r.code, 0);
+  const idCalls = r.calls.filter((c) => c.url.startsWith("https://runner.example/"));
+  assert.equal(idCalls.length, 1);
+  assert.equal(new URL(idCalls[0].url).searchParams.get("audience"), "https://platform.example.com");
+  assert.equal(r.posts[0].headers.authorization, "Bearer h.jwt1.s");
+  assert.equal(r.posts[0].headers["x-cybertis-signature"], undefined);
+  assert.ok(r.logs.includes("::add-mask::h.jwt1.s"));
+});
+
+test("main: auto with no api-token and an OIDC-capable job uploads with OIDC", async () => {
+  const r = await runMain({ env: OIDC_ENV });
+  assert.equal(r.posts.length, 1);
+  assert.equal(r.posts[0].headers.authorization, "Bearer h.jwt1.s");
+});
+
+test("main: prefer-oidc but the job lacks id-token: write — falls back to the api-token", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", "prefer-oidc": "true" } });
+  assert.equal(r.posts[0].headers.authorization, "Bearer ctk_test");
+});
+
+test("main: the id token request fails — falls back to the api-token; without one nothing is uploaded (exit 0)", async () => {
+  const withToken = await runMain({ inputs: { "api-token": "ctk_test", auth: "oidc" }, env: OIDC_ENV, idTokenStatus: 500 });
+  assert.equal(withToken.posts[0].headers.authorization, "Bearer ctk_test");
+  assert.ok(withToken.logs.some((l) => /falling back to api-token/.test(l)));
+  const without = await runMain({ inputs: { auth: "oidc" }, env: OIDC_ENV, idTokenStatus: 500 });
+  assert.equal(without.code, 0);
+  assert.equal(without.posts.length, 0);
+});
+
+test("main: auth: token ignores the OIDC environment even with prefer-oidc", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", auth: "token", "prefer-oidc": "true" }, env: OIDC_ENV });
+  assert.equal(r.posts[0].headers.authorization, "Bearer ctk_test");
+});
+
+test("main: a retried POST carries a FRESH id token (the server consumes each jti once)", async () => {
+  const r = await runMain({ inputs: { "prefer-oidc": "true", "api-token": "ctk_test" }, env: OIDC_ENV, failFirstPost: true });
+  assert.equal(r.posts.length, 2);
+  assert.equal(r.posts[0].headers.authorization, "Bearer h.jwt1.s");
+  assert.equal(r.posts[1].headers.authorization, "Bearer h.jwt2.s");
+});
+
+test("shouldFallBackToToken: only refusals of the OIDC credential itself", () => {
+  assert.equal(shouldFallBackToToken(401, "unauthorized"), true);
+  assert.equal(shouldFallBackToToken(422, "oidc_target_unknown"), true);
+  assert.equal(shouldFallBackToToken(403, "oidc_claims_rejected"), true);
+  assert.equal(shouldFallBackToToken(503, "oidc_unavailable"), true);
+  assert.equal(shouldFallBackToToken(503, "replay_cache_unavailable"), true);
+  assert.equal(shouldFallBackToToken(400, "invalid_body"), false);
+  assert.equal(shouldFallBackToToken(403, "feature_disabled"), false);
+  assert.equal(shouldFallBackToToken(409, "externalid_conflict"), false);
+});
+
+test("main: server refuses the OIDC upload (repo not inventoried yet) → one retry with the signed api-token", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", "prefer-oidc": "true" }, env: OIDC_ENV, firstPost: { status: 422, error: "oidc_target_unknown" } });
+  assert.equal(r.code, 0);
+  assert.equal(r.posts.length, 2);
+  assert.equal(r.posts[0].headers.authorization, "Bearer h.jwt1.s");
+  assert.equal(r.posts[1].headers.authorization, "Bearer ctk_test");
+  assert.ok(r.posts[1].headers["x-cybertis-signature"]);
+  assert.ok(r.logs.some((l) => /retrying with api-token/.test(l)));
+});
+
+test("main: a body error is not retried with the token; no token means no fallback", async () => {
+  const bad = await runMain({ inputs: { "api-token": "ctk_test", "prefer-oidc": "true" }, env: OIDC_ENV, firstPost: { status: 400, error: "invalid_body" } });
+  assert.equal(bad.posts.length, 1);
+  const noToken = await runMain({ env: OIDC_ENV, firstPost: { status: 422, error: "oidc_target_unknown" } });
+  assert.equal(noToken.posts.length, 1);
+});
+
+test("main: auth: oidc without id-token permission and no token names the missing permission", async () => {
+  const r = await runMain({ inputs: { auth: "oidc" } });
+  assert.equal(r.posts.length, 0);
+  assert.ok(r.logs.some((l) => /::notice::.*id-token: write.*skipping upload/.test(l)));
+  assert.ok(!r.logs.some((l) => /create CYBERTIS_SSDLC_TOKEN/.test(l)));
+});
+
+// The PR lane (v1.2.0): scope from the event, run.pullRequest from the payload.
+const envelopeOf = (post) => JSON.parse(Buffer.from(post.body).toString("utf8"));
+const PR_ENV = { GITHUB_EVENT_NAME: "pull_request", GITHUB_REF: "refs/pull/42/merge", GITHUB_SHA: "c".repeat(40), GITHUB_RUN_ID: "9001" };
+
+test("main: pull_request + scope: pull_request + OIDC → PULL_REQUEST envelope with the payload's PR fields", async () => {
+  const r = await runMain({ inputs: { scope: "pull_request", auth: "oidc" }, env: { ...OIDC_ENV, ...PR_ENV }, event: PR_EVENT });
+  assert.equal(r.code, 0);
+  assert.equal(r.posts.length, 1);
+  assert.equal(r.posts[0].headers.authorization, "Bearer h.jwt1.s");
+  const run = envelopeOf(r.posts[0]).run;
+  assert.equal(run.scope, "PULL_REQUEST");
+  assert.deepEqual(run.pullRequest, { number: 42, headSha: SHA_H, baseSha: SHA_B, baseRef: "main" });
+  assert.equal(run.externalId, "gha:acme/app:9001");
+  assert.equal(run.branchRef, "refs/pull/42/merge");
+  assert.equal(run.target.defaultBranch, "main");
+});
+
+test("main: pull_request with token + allow-pr (auto scope) → PULL_REQUEST, signed", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", "allow-pr": "true" }, env: { ...PR_ENV }, event: PR_EVENT });
+  assert.equal(r.posts.length, 1);
+  assert.ok(r.posts[0].headers["x-cybertis-signature"]);
+  assert.equal(envelopeOf(r.posts[0]).run.scope, "PULL_REQUEST");
+});
+
+test("main: a pull_request event without opt-in is still skipped (v1.1 behaviour)", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test" }, env: { ...PR_ENV }, event: PR_EVENT });
+  assert.equal(r.posts.length, 0);
+  assert.ok(r.logs.some((l) => /::notice::.*without scope: pull_request/.test(l)));
+});
+
+test("main: scope: pull_request on a push (no pull_request in the payload) is skipped with a notice", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", scope: "pull_request" } });
+  assert.equal(r.posts.length, 0);
+  assert.ok(r.logs.some((l) => /::notice::.*no pull_request.*skipping upload/.test(l)));
+});
+
+test("main: a run-id override keys the externalId only — ciRunUrl names the real run", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", "run-id": "77-community" }, env: { GITHUB_SERVER_URL: "https://github.com" } });
+  const run = envelopeOf(r.posts[0]).run;
+  assert.equal(run.externalId, "gha:acme/app:77-community");
+  assert.equal(run.ciRunUrl, "https://github.com/acme/app/actions/runs/77");
+});
+
+test("main: push keeps DEFAULT_BRANCH and no pullRequest; an unknown scope warns and falls back to auto", async () => {
+  const r = await runMain({ inputs: { "api-token": "ctk_test", scope: "nightly" }, event: PR_EVENT });
+  assert.equal(r.posts.length, 1);
+  const run = envelopeOf(r.posts[0]).run;
+  assert.equal(run.scope, "DEFAULT_BRANCH");
+  assert.equal(run.pullRequest, undefined);
+  assert.ok(r.logs.some((l) => /::warning::.*unknown scope "nightly"/.test(l)));
+});
+
+test("action.yml passes every input the script reads (scope included)", () => {
+  const yml = readFileSync(new URL("./action.yml", import.meta.url), "utf8");
+  const script = readFileSync(new URL("./upload.mjs", import.meta.url), "utf8");
+  const read = [...script.matchAll(/(?:input|safeToolValues)\("([a-z-]+)"/g)].map((m) => m[1]);
+  for (const name of ["scope", "coverage", "profile", "execution", "run-id"]) assert.ok(read.includes(name), `${name} not detected`);
+  for (const name of new Set(read)) {
+    assert.match(yml, new RegExp(`^  ${name}:$`, "m"), `input ${name} not declared`);
+    assert.match(yml, new RegExp(`INPUT_${name.replace(/-/g, "_").toUpperCase()}: \\$\\{\\{ inputs\\.${name} \\}\\}`), `input ${name} not passed`);
+  }
 });

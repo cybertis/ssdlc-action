@@ -123,9 +123,42 @@ export function expandGlob(pattern, cwd = process.cwd()) {
   return files.filter((f) => re.test(path.relative(base, f).split(path.sep).join("/"))).sort();
 }
 
+export const SCOPES = ["DEFAULT_BRANCH", "SCHEDULED", "PULL_REQUEST"];
+// The `scope` input (README "Pull requests"): auto | push | schedule |
+// pull_request, or the wire value itself (v1.1 workflows pass `SCHEDULED`).
+const SCOPE_INPUTS = {
+  auto: null, push: "DEFAULT_BRANCH", default_branch: "DEFAULT_BRANCH",
+  schedule: "SCHEDULED", scheduled: "SCHEDULED", pull_request: "PULL_REQUEST",
+};
+export const PR_EVENTS = ["pull_request", "pull_request_target"];
+
+/** True for "" and every value `resolveScope` understands; anything else is ignored with a warning. */
+export const isKnownScopeInput = (explicit) => !explicit || Object.hasOwn(SCOPE_INPUTS, String(explicit).trim().toLowerCase());
+
+/** The run's scope: the `scope` input, else (auto / unknown) from the event — schedule → SCHEDULED, a PR event → PULL_REQUEST, anything else → DEFAULT_BRANCH. */
 export function resolveScope(explicit, eventName) {
-  if (explicit) return explicit.toUpperCase();
-  return eventName === "schedule" ? "SCHEDULED" : "DEFAULT_BRANCH";
+  const key = String(explicit ?? "").trim().toLowerCase();
+  const mapped = Object.hasOwn(SCOPE_INPUTS, key) ? SCOPE_INPUTS[key] : null;
+  if (mapped) return mapped;
+  if (eventName === "schedule") return "SCHEDULED";
+  return PR_EVENTS.includes(eventName) ? "PULL_REQUEST" : "DEFAULT_BRANCH";
+}
+
+/**
+ * `run.pullRequest` from the event payload (`GITHUB_EVENT_PATH`): number,
+ * head / base commit and the base branch. Null when the payload has no
+ * well-formed pull_request (a push event, a hand-set `scope: pull_request`).
+ */
+export function pullRequestFromEvent(event) {
+  const pr = event?.pull_request;
+  const sha = (v) => (typeof v === "string" && /^[0-9a-f]{40}$/.test(v) ? v : null);
+  const number = pr?.number;
+  const headSha = sha(pr?.head?.sha);
+  const baseSha = sha(pr?.base?.sha);
+  const baseRef = pr?.base?.ref;
+  if (!Number.isSafeInteger(number) || number <= 0 || !headSha || !baseSha) return null;
+  if (typeof baseRef !== "string" || !baseRef || baseRef.length > 255 || /[\x00-\x1f\x7f]/.test(baseRef)) return null;
+  return { number, headSha, baseSha, baseRef };
 }
 
 export function targetKindFor(key, explicit) {
@@ -135,10 +168,61 @@ export function targetKindFor(key, explicit) {
   return "REPOSITORY";
 }
 
-/** Returns a `::notice::` reason when the run should be skipped, else null. */
-export function skipReason({ token, eventName, allowPr }) {
-  if (!token) return "api-token is empty — skipping upload (create CYBERTIS_SSDLC_TOKEN to enable the SSDLC feed)";
-  if (eventName === "pull_request" && !allowPr) return "pull_request event and allow-pr=false — skipping upload (v1 ingest accepts main/scheduled scopes only)";
+export const AUTH_MODES = ["token", "oidc", "auto"];
+
+/**
+ * Which credential the upload uses (README "Authentication"):
+ *   token  the `api-token` bearer, as in v1.1;
+ *   oidc   a GitHub Actions OIDC id token (the job needs `permissions: id-token: write`);
+ *   auto   (default) OIDC when the runner can mint one (ACTIONS_ID_TOKEN_REQUEST_URL is set)
+ *          AND `api-token` is empty or `prefer-oidc` is true; else the token.
+ * Fails SAFE: OIDC requested but unavailable → the token when there is one.
+ * Returns { mode: "oidc" | "token" | null, note } — null = nothing to authenticate with.
+ */
+export function resolveAuthMode({ auth, token, preferOidc, oidcAvailable }) {
+  const raw = String(auth ?? "").trim().toLowerCase() || "auto";
+  const wanted = AUTH_MODES.includes(raw) ? raw : "auto";
+  const note = wanted === raw ? null : `unknown auth "${auth}" — using auto`;
+  if (wanted === "token") return { mode: token ? "token" : null, note };
+  if (wanted === "oidc" || (wanted === "auto" && (!token || preferOidc))) {
+    if (oidcAvailable) return { mode: "oidc", note };
+    if (wanted === "oidc" && token) return { mode: "token", note: "auth: oidc but the job cannot mint an id token (add `permissions: id-token: write`) — using api-token" };
+    if (wanted === "oidc") return { mode: null, note: "auth: oidc but the job cannot mint an id token (add `permissions: id-token: write`)" };
+  }
+  return { mode: token ? "token" : null, note };
+}
+
+/** The `aud` the id token is minted for: `oidc-audience`, else the endpoint's origin (what the server expects by default). */
+export function oidcAudienceFor(endpoint, explicit) {
+  if (explicit) return explicit;
+  try { return new URL(endpoint).origin; } catch { return endpoint; }
+}
+
+/**
+ * One GitHub Actions OIDC id token. The server consumes each token's `jti`
+ * once, so every request (each POST attempt, each status poll) asks for a
+ * fresh one. Throws on any failure — the caller falls back or gives up.
+ */
+export async function fetchIdToken({ requestUrl, requestToken, audience, fetchImpl = fetch, timeoutMs = 10_000 }) {
+  const url = new URL(requestUrl);
+  url.searchParams.set("audience", audience);
+  const res = await fetchImpl(url.toString(), { headers: { authorization: `bearer ${requestToken}`, accept: "application/json", "user-agent": USER_AGENT }, signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`id token request: HTTP ${res.status}`);
+  const value = (await res.json())?.value;
+  if (typeof value !== "string" || value.split(".").length !== 3) throw new Error("id token request: no token in the response");
+  return value;
+}
+
+/**
+ * Returns a `::notice::` reason when the run should be skipped, else null.
+ * `oidc` = an id token will authenticate instead of `token`. A PR event
+ * uploads only on opt-in — `scope: pull_request` or `allow-pr: true` — so a
+ * v1.1 workflow that also runs on PRs keeps skipping them.
+ */
+export function skipReason({ token, eventName, allowPr, oidc = false, scopeInput = "" }) {
+  if (!token && !oidc) return "api-token is empty — skipping upload (create CYBERTIS_SSDLC_TOKEN to enable the SSDLC feed)";
+  const prOptIn = allowPr || String(scopeInput).trim().toLowerCase() === "pull_request";
+  if (PR_EVENTS.includes(eventName) && !prOptIn) return `${eventName} event without scope: pull_request (or allow-pr: true) — skipping upload`;
   return null;
 }
 
@@ -185,9 +269,12 @@ export function buildEnvelope(ctx, reports) {
     ciProvider: "github-actions",
     completedAt: (ctx.now ?? new Date()).toISOString(),
   };
+  if (run.scope === "PULL_REQUEST" && ctx.pullRequest) run.pullRequest = { ...ctx.pullRequest };
   if (ctx.ref) run.branchRef = ctx.ref;
   if (/^[0-9a-f]{7,40}$/.test(ctx.sha ?? "")) run.commitSha = ctx.sha;
-  if (ctx.serverUrl && ctx.repository && ctx.runId) run.ciRunUrl = `${ctx.serverUrl}/${ctx.repository}/actions/runs/${ctx.runId}`;
+  // The link names the REAL run (`ciRunId` = GITHUB_RUN_ID): a `run-id` input such as `<run_id>-community` only keys the externalId.
+  const urlRunId = ctx.ciRunId || ctx.runId;
+  if (ctx.serverUrl && ctx.repository && urlRunId) run.ciRunUrl = `${ctx.serverUrl}/${ctx.repository}/actions/runs/${urlRunId}`;
   return {
     schema: SCHEMA_ID,
     run,
@@ -216,6 +303,17 @@ export function encodeBody(envelope, { sign, token, now = Date.now() }) {
 export function signHeaders(token, bodyBytes, tsSeconds) {
   const mac = createHmac("sha256", token).update(`${tsSeconds}.${sha256(bodyBytes)}`).digest("hex");
   return { "x-cybertis-timestamp": String(tsSeconds), "x-cybertis-signature": `v1=${mac}` };
+}
+
+/**
+ * The server refused the OIDC credential itself (not the report): the token
+ * may still be accepted — a repository the App has not inventoried yet, an
+ * audience mismatch, the replay cache down. Anything else (400, 409, 413,
+ * feature_disabled…) would fail the same way with the token.
+ */
+export function shouldFallBackToToken(status, code) {
+  if (status === 401) return true;
+  return typeof code === "string" && (code.startsWith("oidc_") || code === "replay_cache_unavailable");
 }
 
 export const isRetryable = (status) => status === 429 || (status >= 500 && status <= 599);
@@ -259,26 +357,27 @@ function writeOutput(name, value) {
   appendFileSync(f, `${name}<<${eol}\n${value}\n${eol}\n`);
 }
 function writeSummary(md) { const f = process.env.GITHUB_STEP_SUMMARY; if (f) appendFileSync(f, `${md}\n`); }
-function readDefaultBranch() {
-  try { return JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"))?.repository?.default_branch; } catch { return undefined; }
+function readEvent() {
+  try { return JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")); } catch { return null; }
 }
 async function errorCode(res) {
-  try { const j = await res.json(); return `${j?.error ?? "error"}${j?.message ? ` — ${String(j.message).slice(0, 200)}` : ""}`; } catch { return "unreadable error body"; }
+  try { const j = await res.json(); return { code: j?.error ?? "error", text: `${j?.error ?? "error"}${j?.message ? ` — ${String(j.message).slice(0, 200)}` : ""}` }; } catch { return { code: null, text: "unreadable error body" }; }
 }
 
-async function postWithRetries(url, body, headers, timeoutMs) {
+/** `authHeader()` is awaited per attempt: an OIDC id token is single-use. */
+async function postWithRetries(url, body, headers, authHeader, timeoutMs) {
   for (let attempt = 1; ; attempt++) {
     try {
-      const res = await fetch(url, { method: "POST", body, headers, signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetch(url, { method: "POST", body, headers: { ...headers, authorization: await authHeader() }, signal: AbortSignal.timeout(timeoutMs) });
       if (res.ok) return { ok: true, status: res.status, json: await res.json() };
-      const detail = await errorCode(res);
+      const { code, text: detail } = await errorCode(res);
       if (isRetryable(res.status) && attempt < MAX_ATTEMPTS) {
         const wait = retryDelayMs(attempt, res.headers.get("retry-after"));
         log.warn(`ssdlc-upload: HTTP ${res.status} ${detail} — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${wait / 1000}s`);
         await new Promise((r) => setTimeout(r, wait));
         continue;
       }
-      return { ok: false, error: `HTTP ${res.status} ${detail}` };
+      return { ok: false, status: res.status, code, error: `HTTP ${res.status} ${detail}` };
     } catch (e) {
       if (attempt < MAX_ATTEMPTS) {
         const wait = retryDelayMs(attempt);
@@ -291,7 +390,7 @@ async function postWithRetries(url, body, headers, timeoutMs) {
   }
 }
 
-async function pollRuns(endpoint, runs, token, timeoutMs) {
+async function pollRuns(endpoint, runs, authHeader, timeoutMs) {
   const deadline = Date.now() + POLL_BUDGET_MS;
   const out = runs.map((r) => ({ ...r }));
   while (Date.now() < deadline && out.some((r) => !isTerminal(r.status))) {
@@ -299,7 +398,7 @@ async function pollRuns(endpoint, runs, token, timeoutMs) {
     for (const [i, r] of out.entries()) {
       if (isTerminal(r.status) || !r.scanRunId) continue;
       try {
-        const res = await fetch(`${endpoint}/${encodeURIComponent(r.scanRunId)}`, { headers: { authorization: `Bearer ${token}`, "user-agent": USER_AGENT }, signal: AbortSignal.timeout(timeoutMs) });
+        const res = await fetch(`${endpoint}/${encodeURIComponent(r.scanRunId)}`, { headers: { authorization: await authHeader(), "user-agent": USER_AGENT }, signal: AbortSignal.timeout(timeoutMs) });
         if (!res.ok) continue;
         const j = await res.json();
         const fresh = j?.runs?.[0] ?? j;
@@ -315,7 +414,18 @@ export async function main() {
   if (token) console.log(`::add-mask::${token}`);
   const eventName = process.env.GITHUB_EVENT_NAME ?? "";
   const failOn = input("fail-on", "none");
-  const skipped = skipReason({ token, eventName, allowPr: truthy(input("allow-pr", "false")) });
+  const oidcEnv = { requestUrl: process.env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "", requestToken: process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "" };
+  const auth = resolveAuthMode({ auth: input("auth", "auto"), token, preferOidc: truthy(input("prefer-oidc", "false")), oidcAvailable: Boolean(oidcEnv.requestUrl && oidcEnv.requestToken) });
+  if (auth.note) log.warn(`ssdlc-upload: ${auth.note}`);
+  const scopeInput = input("scope");
+  if (!isKnownScopeInput(scopeInput)) log.warn(`ssdlc-upload: unknown scope "${scopeInput.slice(0, 40)}" — using auto`);
+  const scope = resolveScope(scopeInput, eventName);
+  const event = readEvent();
+  const pullRequest = scope === "PULL_REQUEST" ? pullRequestFromEvent(event) : null;
+  const skipped = auth.mode === null && auth.note
+    ? `${auth.note} — skipping upload`
+    : skipReason({ token, eventName, allowPr: truthy(input("allow-pr", "false")), oidc: auth.mode === "oidc", scopeInput })
+      ?? (scope === "PULL_REQUEST" && !pullRequest ? `scope PULL_REQUEST but the ${eventName || "unknown"} event payload has no pull_request — skipping upload` : null);
   const emptyOutputs = () => { writeOutput("scan-run-ids", ""); writeOutput("gate-pass", ""); writeOutput("summary-json", "[]"); };
   if (skipped) { log.notice(`ssdlc-upload: ${skipped}`); if (truthy(input("summary", "true"))) writeSummary(renderSummary({ skipped })); emptyOutputs(); return 0; }
 
@@ -349,18 +459,45 @@ export async function main() {
   const repository = process.env.GITHUB_REPOSITORY ?? "";
   const targetKey = input("target-key", `github:${repository}`);
   const envelope = buildEnvelope({
-    repository, runId: input("run-id", process.env.GITHUB_RUN_ID ?? ""), runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+    repository, runId: input("run-id", process.env.GITHUB_RUN_ID ?? ""), ciRunId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
     targetKey, targetKind: input("target-kind"), displayName: input("target-display-name", targetKey.startsWith("github:") ? repository.split("/").pop() : ""),
-    defaultBranch: readDefaultBranch(), internetFacing: input("internet-facing").toLowerCase(), scope: input("scope"), eventName,
+    defaultBranch: event?.repository?.default_branch, internetFacing: input("internet-facing").toLowerCase(), scope, eventName, pullRequest,
     ref: process.env.GITHUB_REF, sha: process.env.GITHUB_SHA, serverUrl: process.env.GITHUB_SERVER_URL,
   }, reports);
-  const { body, headers, gzip, jsonBytes } = encodeBody(envelope, { sign: truthy(input("sign", "true")), token });
-  console.log(`ssdlc-upload: POST ${endpoint} — ${reports.length} report(s), ${jsonBytes} bytes json${gzip ? `, ${body.length} bytes gzip` : ""}, externalId ${envelope.run.externalId}`);
+  let mode = auth.mode;
+  const audience = oidcAudienceFor(endpoint, input("oidc-audience"));
+  const idToken = async () => {
+    const value = await fetchIdToken({ ...oidcEnv, audience, timeoutMs });
+    console.log(`::add-mask::${value}`);
+    return value;
+  };
+  // The first id token doubles as the probe: a runner that cannot mint one falls back to api-token (fails SAFE).
+  let firstIdToken = null;
+  if (mode === "oidc") {
+    try { firstIdToken = await idToken(); } catch (e) {
+      if (!token) { log.warn(`ssdlc-upload: ${e?.message ?? e} — no id token and no api-token, nothing uploaded`); writeSummary(renderSummary({ error: "no OIDC id token and no api-token" })); emptyOutputs(); return 0; }
+      log.warn(`ssdlc-upload: ${e?.message ?? e} — falling back to api-token`);
+      mode = "token";
+    }
+  }
+  // An id token is the credential AND binds the run (the server derives target / commit / run from it): no HMAC.
+  const { body, headers, gzip, jsonBytes } = encodeBody(envelope, { sign: mode === "token" && truthy(input("sign", "true")), token });
+  let authHeader = mode === "oidc"
+    ? async () => { const t = firstIdToken ?? (await idToken()); firstIdToken = null; return `Bearer ${t}`; }
+    : async () => `Bearer ${token}`;
+  console.log(`ssdlc-upload: POST ${endpoint} — ${reports.length} report(s), ${jsonBytes} bytes json${gzip ? `, ${body.length} bytes gzip` : ""}, externalId ${envelope.run.externalId}, scope ${envelope.run.scope}${pullRequest ? ` #${pullRequest.number}` : ""}, auth ${mode}`);
 
-  const res = await postWithRetries(endpoint, body, headers, timeoutMs);
+  let res = await postWithRetries(endpoint, body, headers, authHeader, timeoutMs);
+  if (!res.ok && mode === "oidc" && token && shouldFallBackToToken(res.status, res.code)) {
+    log.warn(`ssdlc-upload: OIDC upload refused (${res.error}) — retrying with api-token`);
+    mode = "token";
+    authHeader = async () => `Bearer ${token}`;
+    const signed = encodeBody(envelope, { sign: truthy(input("sign", "true")), token });
+    res = await postWithRetries(endpoint, signed.body, signed.headers, authHeader, timeoutMs);
+  }
   if (!res.ok) { log.warn(`ssdlc-upload: upload failed — ${res.error}`); writeSummary(renderSummary({ error: res.error })); emptyOutputs(); return 0; }
   let runs = Array.isArray(res.json?.runs) ? res.json.runs : [res.json];
-  if (runs.some((r) => !isTerminal(r.status))) runs = await pollRuns(endpoint, runs, token, timeoutMs);
+  if (runs.some((r) => !isTerminal(r.status))) runs = await pollRuns(endpoint, runs, authHeader, timeoutMs);
   const gate = res.json?.gate ?? null;
   console.log(`ssdlc-upload: HTTP ${res.status} — ${runs.map((r) => `${r.tool}:${r.status}`).join(", ")}${gate ? ` — gate ${gate.mode} pass=${gate.pass}` : ""}`);
   if (truthy(input("summary", "true"))) writeSummary(renderSummary({ runs, gate, dashboard: res.json?.links?.dashboard }));
